@@ -1,127 +1,109 @@
 #!/bin/bash
-
 set -e
 
-######################################################################################
-#                                                                                    #
-# Project 'coramtix-installer'                                                       #
-#                                                                                    #
-# This script is based on pelican-installer (GPL Licensed).                          #
-# Modified for CoRamTix Panel installation.                                          #
-#                                                                                    #
-######################################################################################
+# ======================================
+#  CoRamTix Panel Installer (Fixed)
+#  Single File – No lib.sh required
+# ======================================
 
-fn_exists() { declare -F "$1" >/dev/null; }
-if ! fn_exists lib_loaded; then
-  source /tmp/lib.sh || source <(curl -sSL "$GITHUB_BASE_URL/$GITHUB_SOURCE"/lib/lib.sh)
-  ! fn_exists lib_loaded && echo "* ERROR: Could not load lib script" && exit 1
-fi
+# ----- Utility functions -----
+output() { echo -e "\e[32m$1\e[0m"; }
+warning() { echo -e "\e[33m$1\e[0m"; }
+error() { echo -e "\e[31m$1\e[0m"; }
+print_brake() { printf '%*s\n' "$1" '' | tr ' ' '='; }
 
-# ------------------ Variables ----------------- #
-
-export FQDN=""
-export MYSQL_DB=""
-export MYSQL_USER=""
-export MYSQL_PASSWORD=""
-
-export timezone=""
-export email=""
-
-export user_email=""
-export user_username=""
-export user_firstname=""
-export user_lastname=""
-export user_password=""
-
-export ASSUME_SSL=false
-export CONFIGURE_LETSENCRYPT=false
-export CONFIGURE_FIREWALL=false
-
-check_FQDN_SSL() {
-  if [[ $(invalid_ip "$FQDN") == 1 && $FQDN != 'localhost' ]]; then
-    SSL_AVAILABLE=true
-  else
-    warning "* Let's Encrypt will not be available for IP addresses."
-  fi
+# Random password generator
+gen_passwd() {
+  < /dev/urandom tr -dc A-Za-z0-9 | head -c ${1:-32}
 }
 
+# Required input helper
+required_input() {
+  local var_name=$1
+  local prompt=$2
+  local err=$3
+  local default=$4
+  while true; do
+    echo -n "$prompt"
+    read -r input
+    [ -z "$input" ] && input=$default
+    if [ -n "$input" ]; then
+      eval "$var_name=\"$input\""
+      break
+    else
+      error "$err"
+    fi
+  done
+}
+
+# ----- Installer main -----
 main() {
-  if [ -d "/var/www/coramtix" ]; then
-    warning "The script has detected CoRamTix already exists at /var/www/coramtix!"
-    echo -e -n "* Proceed anyway? (y/N): "
-    read -r CONFIRM_PROCEED
-    [[ ! "$CONFIRM_PROCEED" =~ [Yy] ]] && exit 1
-  fi
+  print_brake 60
+  output "🚀 Installing CoRamTix Panel"
+  print_brake 60
 
-  welcome "CoRamTix Panel"
+  # Update system
+  apt update -y && apt upgrade -y
 
-  check_os_x86_64
+  # Install dependencies
+  apt install -y curl wget tar unzip git jq mariadb-server nginx php php-cli php-mysql php-gd php-curl php-mbstring php-xml composer redis-server
 
-  MYSQL_DB="-"
-  while [[ "$MYSQL_DB" == *"-"* ]]; do
-    required_input MYSQL_DB "Database name (coramtixpanel): " "" "coramtixpanel"
-    [[ "$MYSQL_DB" == *"-"* ]] && error "Database name cannot contain hyphens"
-  done
+  # Database setup
+  MYSQL_DB="coramtix"
+  MYSQL_USER="coramtix"
+  MYSQL_PASSWORD=$(gen_passwd 24)
 
-  MYSQL_USER="-"
-  while [[ "$MYSQL_USER" == *"-"* ]]; do
-    required_input MYSQL_USER "Database username (coramtix): " "" "coramtix"
-    [[ "$MYSQL_USER" == *"-"* ]] && error "Database user cannot contain hyphens"
-  done
+  mysql -u root -e "CREATE DATABASE $MYSQL_DB;"
+  mysql -u root -e "CREATE USER '$MYSQL_USER'@'127.0.0.1' IDENTIFIED BY '$MYSQL_PASSWORD';"
+  mysql -u root -e "GRANT ALL PRIVILEGES ON $MYSQL_DB.* TO '$MYSQL_USER'@'127.0.0.1';"
+  mysql -u root -e "FLUSH PRIVILEGES;"
 
-  rand_pw=$(gen_passwd 64)
-  password_input MYSQL_PASSWORD "Password (press enter to use randomly generated): " "Cannot be empty" "$rand_pw"
+  # Download panel
+  mkdir -p /var/www/coramtix
+  cd /var/www/coramtix
+  curl -L https://github.com/pelican-dev/panel/releases/latest/download/panel.tar.gz | tar -xz
+  composer install --no-dev --optimize-autoloader
 
-  readarray -t valid_timezones <<<"$(curl -s "$GITHUB_URL"/configs/valid_timezones.txt)"
-  while [ -z "$timezone" ]; do
-    echo -n "* Select timezone [UTC]: "
-    read -r timezone_input
-    array_contains_element "$timezone_input" "${valid_timezones[@]}" && timezone="$timezone_input"
-    [ -z "$timezone_input" ] && timezone="UTC"
-  done
+  # Permissions
+  chown -R www-data:www-data /var/www/coramtix
+  chmod -R 755 /var/www/coramtix
 
-  email_input email "Provide system email: " "Email cannot be empty"
+  # Env file
+  cp .env.example .env
+  php artisan key:generate --force
+  php artisan migrate --seed --force
 
-  email_input user_email "Admin email: " "Required"
-  required_input user_username "Admin username: " "Required"
-  required_input user_firstname "Admin firstname: " "Required"
-  required_input user_lastname "Admin lastname: " "Required"
-  password_input user_password "Admin password: " "Required"
+  # Nginx config
+  cat > /etc/nginx/sites-available/coramtix.conf <<EOF
+server {
+    listen 80;
+    server_name _;
+    root /var/www/coramtix/public;
 
-  while [ -z "$FQDN" ]; do
-    echo -n "* Set FQDN (panel.example.com): "
-    read -r FQDN
-    [ -z "$FQDN" ] && error "FQDN cannot be empty"
-  done
+    index index.php;
 
-  check_FQDN_SSL
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
 
-  summary
-
-  echo -e -n "\n* Continue installation? (y/N): "
-  read -r CONFIRM
-  [[ ! "$CONFIRM" =~ [Yy] ]] && exit 1
-
-  run_installer "coramtix"
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
 }
+EOF
 
-summary() {
-  print_brake 62
-  output "CoRamTix panel on $OS"
-  output "Database: $MYSQL_DB"
-  output "User: $MYSQL_USER"
-  output "Timezone: $timezone"
-  output "Admin: $user_username"
-  output "FQDN: $FQDN"
-  print_brake 62
-}
+  ln -s /etc/nginx/sites-available/coramtix.conf /etc/nginx/sites-enabled/
+  nginx -t && systemctl restart nginx
 
-goodbye() {
-  print_brake 62
-  output "✅ CoRamTix Panel installation completed"
-  output "Visit: https://$FQDN"
-  print_brake 62
+  print_brake 60
+  output "✅ CoRamTix Panel Installed!"
+  output "DB Name: $MYSQL_DB"
+  output "DB User: $MYSQL_USER"
+  output "DB Pass: $MYSQL_PASSWORD"
+  print_brake 60
 }
 
 main
-goodbye
